@@ -1,0 +1,4 @@
+{
+  "name": "Ona Events",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12"
+}
