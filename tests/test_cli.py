@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import unittest
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from gitpod.types.event_watch_response import EventWatchResponse
 
 from ona_events_demo.cli import (
+    ENVIRONMENT_DETAILS_LOG,
     build_base_url,
-    enriched_log_record,
+    selected_stdout_record,
 )
 
 
@@ -86,8 +91,16 @@ class FakeRunners:
                 status=SimpleNamespace(
                     phase="RUNNER_PHASE_ACTIVE",
                     region="us-east-2",
+                    gateway_info=SimpleNamespace(
+                        gateway=SimpleNamespace(
+                            url="https://runner-proxy.example.com",
+                            name="proxy",
+                            region="us-east-2",
+                        )
+                    ),
                     system_details="m6i.large in VPC",
                     additional_info=[
+                        SimpleNamespace(key="awsAccountID", value="123456789012"),
                         SimpleNamespace(key="privateIpAddress", value="10.0.0.5"),
                         SimpleNamespace(key="instanceName", value="i-123"),
                     ],
@@ -109,67 +122,50 @@ class CliTests(unittest.TestCase):
     def test_build_base_url_preserves_explicit_path(self) -> None:
         self.assertEqual(build_base_url("https://ona.example/custom"), "https://ona.example/custom/api")
 
-    def test_enriched_log_record_separates_watch_event_and_enrichment(self) -> None:
+    def test_selected_stdout_record_logs_full_environment_details(self) -> None:
         event = EventWatchResponse(
             resourceType="RESOURCE_TYPE_ENVIRONMENT",
             resourceId="env-1",
             operation="RESOURCE_OPERATION_UPDATE",
         )
 
-        record = enriched_log_record(FakeClient(), event)
+        with TemporaryDirectory() as temp_dir, patch("ona_events_demo.cli.ENVIRONMENT_DETAILS_LOG", str(Path(temp_dir) / ENVIRONMENT_DETAILS_LOG)):
+            record = selected_stdout_record(FakeClient(), event)
+            details = (Path(temp_dir) / ENVIRONMENT_DETAILS_LOG).read_text(encoding="utf-8")
+            detail_record = json.loads(details)
 
         self.assertEqual(
             record,
             {
-                "watchEvent": {
-                    "resourceType": "RESOURCE_TYPE_ENVIRONMENT",
-                    "resourceId": "env-1",
-                    "operation": "RESOURCE_OPERATION_UPDATE",
-                },
-                "enrichedData": {
-                    "organizationId": "org-1",
-                    "runnerId": "runner-1",
-                    "creatorId": "user-1",
-                    "creatorEmail": "creator@example.com",
-                    "projectId": "project-1",
-                    "gitRepoURL": "https://github.com/acme/example.git",
-                    "gitRepoBranch": "main",
-                    "environmentStatus": {
-                        "phase": "ENVIRONMENT_PHASE_RUNNING",
-                        "statusVersion": "42",
-                        "failureMessage": [],
-                        "warningMessage": [],
-                    },
-                    "machine": {
-                        "requestedClass": "large",
-                        "phase": "PHASE_RUNNING",
-                        "session": "machine-session",
-                        "timeout": None,
-                        "versions": {
-                            "ami_id": "ami-123",
-                            "supervisor_commit": "abc123",
-                            "supervisor_version": "1.2.3",
-                        },
-                        "failureMessage": None,
-                        "warningMessage": None,
-                        "runner": {
-                            "id": "runner-1",
-                            "name": "aws-runner",
-                            "kind": "RUNNER_KIND_REMOTE",
-                            "provider": "RUNNER_PROVIDER_AWS_EC2",
-                            "runnerManagerId": "runner-manager-1",
-                            "region": "us-east-2",
-                            "statusPhase": "RUNNER_PHASE_ACTIVE",
-                            "systemDetails": "m6i.large in VPC",
-                            "additionalInfo": [
-                                {"key": "privateIpAddress", "value": "10.0.0.5"},
-                                {"key": "instanceName", "value": "i-123"},
-                            ],
-                        },
-                    },
-                },
+                "environmentID": "env-1",
+                "operation": "RESOURCE_OPERATION_UPDATE",
+                "organizationId": "org-1",
+                "creatorId": "user-1",
+                "creatorEmail": "creator@example.com",
+                "projectId": "project-1",
+                "gitRepoURL": "https://github.com/acme/example.git",
+                "gitRepoBranch": "main",
+                "phase": "ENVIRONMENT_PHASE_RUNNING",
+                "awsAccountID": "123456789012",
+                "region": "us-east-2",
+                "runnerProxyDomain": "runner-proxy.example.com",
+                "runnerID": "runner-1",
+                "sessionID": "machine-session",
             },
         )
+        self.assertGreater(len(details.splitlines()), 1)
+        self.assertEqual(detail_record["environment"]["metadata"]["organization_id"], "org-1")
+        self.assertEqual(detail_record["creator"]["email"], "creator@example.com")
+        self.assertEqual(detail_record["runner"]["kind"], "RUNNER_KIND_REMOTE")
+
+    def test_non_environment_events_are_not_written_to_stdout(self) -> None:
+        event = EventWatchResponse(
+            resourceType="RESOURCE_TYPE_PROJECT",
+            resourceId="project-1",
+            operation="RESOURCE_OPERATION_UPDATE",
+        )
+
+        self.assertIsNone(selected_stdout_record(FakeClient(), event))
 
 
 if __name__ == "__main__":

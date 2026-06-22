@@ -1,7 +1,8 @@
 # ona-events
 
-Demo Python app that subscribes to Ona's `WatchEvents` stream and logs every
-received event to stdout as one JSON object per line.
+Demo Python app that subscribes to Ona's `WatchEvents` stream, writes raw
+events to `watchevents.log`, and prints selected environment enrichment fields
+to stdout as formatted JSON.
 
 ## Setup
 
@@ -49,65 +50,59 @@ For nonstandard deployments, pass a full API URL:
 ona-events --base-url https://example.com/api
 ```
 
-## Log output
+## Log Output
 
-Each line is a JSON object with the original watch event separated from
-data fetched through follow-up API calls:
+Every raw watch event is written to `watchevents.log` as one JSON object per
+line.
+
+Environment events are enriched with follow-up API calls. For every enrichment,
+the complete API data is written to `environment-details.log` as a formatted
+JSON object:
 
 ```json
 {
-  "watchEvent": {
-    "operation": "RESOURCE_OPERATION_UPDATE",
-    "resourceId": "env-uuid",
-    "resourceType": "RESOURCE_TYPE_ENVIRONMENT"
+  "environment": {
+    "id": "env-uuid",
+    "metadata": {},
+    "spec": {},
+    "status": {}
   },
-  "enrichedData": {
-    "organizationId": "org-uuid",
+  "creator": {
+    "id": "user-uuid",
+    "email": "creator@example.com"
+  },
+  "runner": {
     "runnerId": "runner-uuid",
-    "creatorId": "user-uuid",
-    "creatorEmail": "creator@example.com",
-    "projectId": "project-uuid",
-    "gitRepoURL": "https://github.com/example/repo.git",
-    "gitRepoBranch": "main",
-    "environmentStatus": {
-      "phase": "ENVIRONMENT_PHASE_RUNNING",
-      "statusVersion": "42",
-      "failureMessage": [],
-      "warningMessage": []
-    },
-    "machine": {
-      "requestedClass": "large",
-      "phase": "PHASE_RUNNING",
-      "session": "machine-session",
-      "timeout": null,
-      "versions": {
-        "amiId": "ami-123",
-        "supervisorCommit": "abc123",
-        "supervisorVersion": "1.2.3"
-      },
-      "failureMessage": null,
-      "warningMessage": null,
-      "runner": {
-        "id": "runner-uuid",
-        "name": "aws-runner",
-        "kind": "RUNNER_KIND_REMOTE",
-        "provider": "RUNNER_PROVIDER_AWS_EC2",
-        "runnerManagerId": "runner-manager-uuid",
-        "region": "us-east-1",
-        "statusPhase": "RUNNER_PHASE_ACTIVE",
-        "systemDetails": "provider-specific details when available",
-        "additionalInfo": [
-          {"key": "privateIpAddress", "value": "10.0.0.5"},
-          {"key": "instanceName", "value": "i-123"}
-        ]
-      }
-    }
+    "name": "aws-runner",
+    "status": {}
   }
 }
 ```
 
-Only environment events are enriched. Non-environment events are still logged
-with the same top-level shape and `enrichedData` set to `null`.
+Stdout only receives the selected fields from enriched environment data as
+formatted JSON:
+
+```json
+{
+  "environmentID": "env-uuid",
+  "operation": "RESOURCE_OPERATION_UPDATE",
+  "organizationId": "org-uuid",
+  "creatorId": "user-uuid",
+  "creatorEmail": "creator@example.com",
+  "projectId": "project-uuid",
+  "gitRepoURL": "https://github.com/example/repo.git",
+  "gitRepoBranch": "main",
+  "phase": "ENVIRONMENT_PHASE_RUNNING",
+  "awsAccountID": "123456789012",
+  "region": "us-east-1",
+  "runnerProxyDomain": "runner-proxy.example.com",
+  "runnerID": "runner-uuid",
+  "sessionID": "machine-session"
+}
+```
+
+Only environment events are enriched and printed to stdout. Non-environment
+events are only written to `watchevents.log`.
 Machine details are limited to what the Ona API exposes for the environment
-and runner; provider-specific values such as IP address or EC2 instance name
-appear under `machine.runner.additionalInfo` when present.
+and runner. `awsAccountID` is populated from runner `additionalInfo` when the
+API includes an AWS account field.

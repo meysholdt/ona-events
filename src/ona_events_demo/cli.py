@@ -10,6 +10,8 @@ from urllib.parse import urlsplit, urlunsplit
 from gitpod import Gitpod
 
 DEFAULT_HOST = "app.gitpod.io"
+WATCH_EVENTS_LOG = "watchevents.log"
+ENVIRONMENT_DETAILS_LOG = "environment-details.log"
 
 
 def build_base_url(host: str) -> str:
@@ -32,7 +34,7 @@ def build_base_url(host: str) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Subscribe to Ona WatchEvents and write each event to stdout as JSON.",
+        description="Subscribe to Ona WatchEvents, write raw events to log files, and print selected enrichment fields.",
     )
     parser.add_argument(
         "--host",
@@ -60,8 +62,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def event_to_json(event: Any) -> str:
-    return json.dumps(event_to_log_record(event), sort_keys=True, separators=(",", ":"))
+def as_json(value: Any) -> str:
+    return json.dumps(to_payload(value), sort_keys=True, separators=(",", ":"))
+
+
+def as_formatted_json(value: Any) -> str:
+    return json.dumps(to_payload(value), indent=2, sort_keys=True)
+
+
+def write_json_line(path: str, value: Any) -> None:
+    with open(path, "a", encoding="utf-8") as log_file:
+        log_file.write(as_json(value))
+        log_file.write("\n")
+
+
+def write_formatted_json(path: str, value: Any) -> None:
+    with open(path, "a", encoding="utf-8") as log_file:
+        log_file.write(as_formatted_json(value))
+        log_file.write("\n")
 
 
 def to_payload(value: Any) -> Any:
@@ -86,11 +104,8 @@ def to_payload(value: Any) -> Any:
     return value
 
 
-def event_to_log_record(event: Any, enriched_data: dict[str, Any] | None = None) -> dict[str, Any]:
-    return {
-        "watchEvent": to_payload(event),
-        "enrichedData": enriched_data,
-    }
+def event_to_json(event: Any) -> str:
+    return as_json(event)
 
 
 def creator_id_from_environment(environment: Any) -> str | None:
@@ -117,79 +132,97 @@ def first_initializer_git(environment: Any) -> Any | None:
     return None
 
 
-def creator_email(client: Gitpod, environment: Any, errors: list[str]) -> str | None:
+def fetch_creator(client: Gitpod, environment: Any, errors: list[str]) -> Any | None:
     creator_id = creator_id_from_environment(environment)
     creator_principal = creator_principal_from_environment(environment)
     if not creator_id or creator_principal != "PRINCIPAL_USER":
         return None
 
     try:
-        user_response = client.users.get_user(user_id=creator_id)
-        return getattr(getattr(user_response, "user", None), "email", None)
+        return client.users.get_user(user_id=creator_id)
     except Exception as exc:
         errors.append(f"failed to fetch creator email for user {creator_id}: {exc}")
         return None
 
 
-def runner_enrichment(client: Gitpod, runner_id: str | None, errors: list[str]) -> dict[str, Any] | None:
+def fetch_runner(client: Gitpod, runner_id: str | None, errors: list[str]) -> Any | None:
     if not runner_id:
         return None
 
     try:
-        runner_response = client.runners.retrieve(runner_id=runner_id)
+        return client.runners.retrieve(runner_id=runner_id)
     except Exception as exc:
         errors.append(f"failed to fetch runner {runner_id}: {exc}")
+        return None
+
+
+def creator_email(creator_response: Any | None) -> str | None:
+    return getattr(getattr(creator_response, "user", None), "email", None)
+
+
+def additional_info_value(runner_response: Any | None, keys: set[str]) -> str | None:
+    if runner_response is None:
+        return None
+
+    runner_status = getattr(getattr(runner_response, "runner", None), "status", None)
+    for item in getattr(runner_status, "additional_info", None) or []:
+        key = getattr(item, "key", None)
+        if key in keys:
+            return getattr(item, "value", None)
+    return None
+
+
+def runner_proxy_domain(runner_response: Any | None) -> str | None:
+    if runner_response is None:
+        return None
+
+    runner_status = getattr(getattr(runner_response, "runner", None), "status", None)
+    gateway_info = getattr(runner_status, "gateway_info", None)
+    gateway = getattr(gateway_info, "gateway", None)
+    gateway_url = getattr(gateway, "url", None)
+    if not gateway_url:
+        return None
+
+    parsed = urlsplit(gateway_url)
+    return parsed.netloc or parsed.path or gateway_url
+
+
+def runner_region(runner_response: Any | None) -> str | None:
+    if runner_response is None:
         return None
 
     runner = runner_response.runner
     runner_spec = getattr(runner, "spec", None)
     runner_configuration = getattr(runner_spec, "configuration", None)
     runner_status = getattr(runner, "status", None)
+    return getattr(runner_status, "region", None) or getattr(runner_configuration, "region", None)
 
-    return {
-        "id": getattr(runner, "runner_id", None),
-        "name": getattr(runner, "name", None),
-        "kind": getattr(runner, "kind", None),
-        "provider": getattr(runner, "provider", None),
-        "runnerManagerId": getattr(runner, "runner_manager_id", None),
-        "region": getattr(runner_status, "region", None) or getattr(runner_configuration, "region", None),
-        "statusPhase": getattr(runner_status, "phase", None),
-        "systemDetails": getattr(runner_status, "system_details", None),
-        "additionalInfo": to_payload(getattr(runner_status, "additional_info", None)),
+
+def environment_details_record(
+    environment_response: Any,
+    creator_response: Any | None,
+    runner_response: Any | None,
+    errors: list[str],
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "environment": to_payload(getattr(environment_response, "environment", None)),
+        "creator": to_payload(getattr(creator_response, "user", None)),
+        "runner": to_payload(getattr(runner_response, "runner", None)),
     }
+    if errors:
+        record["errors"] = errors
+    return record
 
 
-def machine_enrichment(client: Gitpod, environment: Any, runner_id: str | None, errors: list[str]) -> dict[str, Any]:
-    spec = getattr(environment, "spec", None)
-    status = getattr(environment, "status", None)
-    spec_machine = getattr(spec, "machine", None)
-    status_machine = getattr(status, "machine", None)
-
-    return {
-        "requestedClass": getattr(spec_machine, "class_", None),
-        "phase": getattr(status_machine, "phase", None),
-        "session": getattr(status_machine, "session", None),
-        "timeout": getattr(status_machine, "timeout", None),
-        "versions": to_payload(getattr(status_machine, "versions", None)),
-        "failureMessage": getattr(status_machine, "failure_message", None),
-        "warningMessage": getattr(status_machine, "warning_message", None),
-        "runner": runner_enrichment(client, runner_id, errors),
-    }
-
-
-def environment_status_enrichment(environment: Any) -> dict[str, Any]:
-    status = getattr(environment, "status", None)
-    return {
-        "phase": getattr(status, "phase", None),
-        "statusVersion": getattr(status, "status_version", None),
-        "failureMessage": getattr(status, "failure_message", None),
-        "warningMessage": getattr(status, "warning_message", None),
-    }
-
-
-def enrich_environment_event(client: Gitpod, environment_id: str) -> dict[str, Any]:
-    response = client.environments.retrieve(environment_id=environment_id)
-    environment = response.environment
+def selected_environment_fields(
+    environment_response: Any,
+    creator_response: Any | None,
+    runner_response: Any | None,
+    environment_id: str,
+    operation: str | None,
+    errors: list[str],
+) -> dict[str, Any]:
+    environment = environment_response.environment
     metadata = getattr(environment, "metadata", None)
     status = getattr(environment, "status", None)
     content = getattr(status, "content", None)
@@ -198,7 +231,8 @@ def enrich_environment_event(client: Gitpod, environment_id: str) -> dict[str, A
 
     creator_id = creator_id_from_environment(environment)
     runner_id = getattr(metadata, "runner_id", None)
-    errors: list[str] = []
+    spec = getattr(environment, "spec", None)
+    status_machine = getattr(status, "machine", None)
 
     git_repo_url = getattr(git, "clone_url", None) or getattr(initializer_git, "remote_uri", None)
     branch = getattr(git, "branch", None)
@@ -209,15 +243,20 @@ def enrich_environment_event(client: Gitpod, environment_id: str) -> dict[str, A
         branch = getattr(initializer_git, "clone_target", None)
 
     enriched_data: dict[str, Any] = {
+        "environmentID": environment_id,
+        "operation": operation,
         "organizationId": getattr(metadata, "organization_id", None),
-        "runnerId": runner_id,
         "creatorId": creator_id,
-        "creatorEmail": creator_email(client, environment, errors),
+        "creatorEmail": creator_email(creator_response),
         "projectId": getattr(metadata, "project_id", None),
         "gitRepoURL": git_repo_url,
         "gitRepoBranch": branch,
-        "environmentStatus": environment_status_enrichment(environment),
-        "machine": machine_enrichment(client, environment, runner_id, errors),
+        "phase": getattr(status, "phase", None),
+        "awsAccountID": additional_info_value(runner_response, {"awsAccountID", "awsAccountId", "awsAccount"}),
+        "region": runner_region(runner_response),
+        "runnerProxyDomain": runner_proxy_domain(runner_response),
+        "runnerID": runner_id,
+        "sessionID": getattr(status_machine, "session", None) or getattr(getattr(spec, "machine", None), "session", None),
     }
     if errors:
         enriched_data["errors"] = errors
@@ -225,30 +264,40 @@ def enrich_environment_event(client: Gitpod, environment_id: str) -> dict[str, A
     return enriched_data
 
 
-def enriched_log_record(client: Gitpod, event: Any) -> dict[str, Any]:
+def enrich_environment_event(client: Gitpod, environment_id: str, operation: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    response = client.environments.retrieve(environment_id=environment_id)
+    environment = response.environment
+    metadata = getattr(environment, "metadata", None)
+    runner_id = getattr(metadata, "runner_id", None)
+    errors: list[str] = []
+
+    creator_response = fetch_creator(client, environment, errors)
+    runner_response = fetch_runner(client, runner_id, errors)
+
+    return (
+        selected_environment_fields(response, creator_response, runner_response, environment_id, operation, errors),
+        environment_details_record(response, creator_response, runner_response, errors),
+    )
+
+
+def selected_stdout_record(client: Gitpod, event: Any) -> dict[str, Any] | None:
     resource_type = getattr(event, "resource_type", None)
     resource_id = getattr(event, "resource_id", None)
 
     if resource_type != "RESOURCE_TYPE_ENVIRONMENT":
-        return event_to_log_record(event)
+        return None
 
     if not resource_id:
-        return event_to_log_record(
-            event,
-            {
-                "error": "environment event did not include resourceId",
-            },
-        )
+        return {"error": "environment event did not include resourceId"}
 
     try:
-        return event_to_log_record(event, enrich_environment_event(client, resource_id))
+        selected_fields, details_record = enrich_environment_event(client, resource_id, getattr(event, "operation", None))
+        write_formatted_json(ENVIRONMENT_DETAILS_LOG, details_record)
+        return selected_fields
     except Exception as exc:
-        return event_to_log_record(
-            event,
-            {
-                "error": f"failed to enrich environment {resource_id}: {exc}",
-            },
-        )
+        error_record = {"error": f"failed to enrich environment {resource_id}: {exc}"}
+        write_formatted_json(ENVIRONMENT_DETAILS_LOG, {"environmentId": resource_id, **error_record})
+        return error_record
 
 
 def watch_events(args: argparse.Namespace) -> None:
@@ -268,7 +317,10 @@ def watch_events(args: argparse.Namespace) -> None:
             ]
 
     for event in client.events.watch(**watch_kwargs):
-        print(json.dumps(enriched_log_record(client, event), sort_keys=True, separators=(",", ":")), flush=True)
+        write_json_line(WATCH_EVENTS_LOG, event)
+        stdout_record = selected_stdout_record(client, event)
+        if stdout_record is not None:
+            print(as_formatted_json(stdout_record), flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
